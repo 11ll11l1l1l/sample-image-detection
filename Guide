@@ -1,0 +1,504 @@
+To create an image analysis program using Python for detecting bump size, position, and anomalies using 2D X-ray images, you can follow these steps:
+
+
+---
+
+1. Install Required Libraries
+
+pip install opencv-python numpy scikit-image matplotlib
+
+
+---
+
+2. Load and Preprocess the Image
+
+Convert the image to grayscale.
+
+Apply adaptive thresholding or edge detection to isolate bumps.
+
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load the X-ray image
+image = cv2.imread("xray_image.png", cv2.IMREAD_GRAYSCALE)
+
+# Apply Gaussian blur to reduce noise
+blurred = cv2.GaussianBlur(image, (5, 5), 0)
+
+# Use adaptive thresholding for better contrast
+thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                               cv2.THRESH_BINARY_INV, 11, 2)
+
+# Display the thresholded image
+plt.imshow(thresh, cmap="gray")
+plt.title("Thresholded Image")
+plt.show()
+
+
+---
+
+3. Detect Bumps Using Contours
+
+Use OpenCV’s findContours to detect circular structures.
+
+Filter based on size to remove noise.
+
+
+# Find contours in the binary image
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+# Filter bumps based on area and circularity
+bump_contours = []
+for cnt in contours:
+    area = cv2.contourArea(cnt)
+    if 100 < area < 2000:  # Adjust these values based on expected bump size
+        perimeter = cv2.arcLength(cnt, True)
+        circularity = 4 * np.pi * (area / (perimeter ** 2))
+        if 0.7 < circularity < 1.2:  # Close to 1 means it's a circle
+            bump_contours.append(cnt)
+
+# Draw detected bumps
+image_bumps = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+cv2.drawContours(image_bumps, bump_contours, -1, (0, 255, 0), 2)
+
+plt.imshow(image_bumps)
+plt.title("Detected Bumps")
+plt.show()
+
+
+---
+
+4. Measure Bump Size & Position
+
+Extract centroids and diameters.
+
+
+bump_data = []
+
+for cnt in bump_contours:
+    M = cv2.moments(cnt)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])  # X-coordinate of bump center
+        cy = int(M["m01"] / M["m00"])  # Y-coordinate of bump center
+        area = cv2.contourArea(cnt)
+        diameter = np.sqrt(4 * area / np.pi)  # Approximate as a circle
+
+        bump_data.append((cx, cy, diameter))
+
+# Display bump positions and sizes
+for cx, cy, d in bump_data:
+    cv2.circle(image_bumps, (cx, cy), int(d / 2), (255, 0, 0), 2)
+    cv2.putText(image_bumps, f"{d:.1f}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+plt.imshow(image_bumps)
+plt.title("Bump Sizes & Positions")
+plt.show()
+
+
+---
+
+5. Detect Anomalies
+
+Check for missing bumps by comparing expected vs. detected bumps.
+
+Look for overlapping bumps or non-circular defects.
+
+
+Missing Bumps Detection
+
+If bumps are arranged in a grid, compare detected bump positions with expected ones.
+
+
+expected_bump_positions = [(x, y) for x in range(50, 500, 50) for y in range(50, 500, 50)]
+detected_positions = [(cx, cy) for cx, cy, _ in bump_data]
+
+missing_bumps = set(expected_bump_positions) - set(detected_positions)
+
+for mx, my in missing_bumps:
+    cv2.circle(image_bumps, (mx, my), 10, (0, 0, 255), -1)  # Mark missing bumps
+
+plt.imshow(image_bumps)
+plt.title("Missing Bumps Highlighted")
+plt.show()
+
+
+---
+
+6. Output Data (Optional)
+
+You can save bump details in a CSV file.
+
+import pandas as pd
+
+df = pd.DataFrame(bump_data, columns=["X", "Y", "Diameter"])
+df.to_csv("bump_inspection_results.csv", index=False)
+print(df)
+
+
+---
+
+Given your complex X-ray image conditions, where bumps vary in hue, alignment, and contrast, and cold joints can be identified by overlap and color differences, we need a more robust image processing approach. Here’s how to refine the detection:
+
+
+---
+
+1. Strategy for Detection
+
+1. Normalize Contrast: Use CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance visibility.
+
+
+2. Multi-Threshold Segmentation: Differentiate white, black, and light bumps.
+
+
+3. Edge Detection & Shape Filtering: Identify bumps despite varying hues.
+
+
+4. Overlapping (Cold Joint) Detection: Identify overlaps based on pixel intensity and contour merging.
+
+
+
+
+---
+
+2. Improved Image Preprocessing
+
+Since bumps have varying brightness, Adaptive Histogram Equalization (CLAHE) will enhance features.
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load image
+image = cv2.imread("xray_image.png", cv2.IMREAD_GRAYSCALE)
+
+# Apply CLAHE for contrast normalization
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+image_clahe = clahe.apply(image)
+
+# Apply Gaussian Blur to reduce noise
+blurred = cv2.GaussianBlur(image_clahe, (5,5), 0)
+
+# Display results
+plt.figure(figsize=(10,5))
+plt.subplot(1,2,1), plt.imshow(image, cmap='gray'), plt.title("Original X-ray")
+plt.subplot(1,2,2), plt.imshow(image_clahe, cmap='gray'), plt.title("CLAHE Enhanced")
+plt.show()
+
+
+---
+
+3. Multi-Threshold Segmentation for Mixed Colors
+
+Since bumps have varying intensities, multiple thresholds help segment them.
+
+# Apply multiple thresholds to extract bumps of different brightness levels
+_, thresh_dark = cv2.threshold(image_clahe, 50, 255, cv2.THRESH_BINARY)  # Dark bumps
+_, thresh_light = cv2.threshold(image_clahe, 180, 255, cv2.THRESH_BINARY_INV)  # Light bumps
+
+# Combine thresholds
+thresh_combined = cv2.bitwise_or(thresh_dark, thresh_light)
+
+# Display thresholded images
+plt.figure(figsize=(15,5))
+plt.subplot(1,3,1), plt.imshow(thresh_dark, cmap="gray"), plt.title("Dark Bumps")
+plt.subplot(1,3,2), plt.imshow(thresh_light, cmap="gray"), plt.title("Light Bumps")
+plt.subplot(1,3,3), plt.imshow(thresh_combined, cmap="gray"), plt.title("Combined")
+plt.show()
+
+
+---
+
+4. Contour Detection & Circularity Filtering
+
+Since bumps may not always be aligned, we detect contours and filter by shape and area.
+
+# Find contours
+contours, _ = cv2.findContours(thresh_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+# Filter bumps based on circularity and area
+bump_contours = []
+for cnt in contours:
+    area = cv2.contourArea(cnt)
+    perimeter = cv2.arcLength(cnt, True)
+    if perimeter == 0:
+        continue
+    circularity = 4 * np.pi * (area / (perimeter ** 2))
+    
+    if 0.6 < circularity < 1.2 and 50 < area < 2000:  # Adjust based on bump size
+        bump_contours.append(cnt)
+
+# Draw detected bumps
+image_bumps = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+cv2.drawContours(image_bumps, bump_contours, -1, (0, 255, 0), 2)
+
+plt.imshow(image_bumps)
+plt.title("Detected Bumps")
+plt.show()
+
+
+---
+
+5. Cold Joint & Overlapping Bump Detection
+
+Cold joints appear as overlapping or fused contours. We use contour merging detection.
+
+def detect_cold_joints(contours):
+    cold_joints = []
+    for i, cnt1 in enumerate(contours):
+        x1, y1, w1, h1 = cv2.boundingRect(cnt1)
+        for j, cnt2 in enumerate(contours):
+            if i >= j:
+                continue
+            x2, y2, w2, h2 = cv2.boundingRect(cnt2)
+            if abs(x1 - x2) < 10 and abs(y1 - y2) < 10:  # Threshold for overlap
+                cold_joints.append((cnt1, cnt2))
+    return cold_joints
+
+cold_joint_pairs = detect_cold_joints(bump_contours)
+
+# Draw cold joint defects
+for cnt1, cnt2 in cold_joint_pairs:
+    cv2.drawContours(image_bumps, [cnt1], -1, (0, 0, 255), 2)  # Mark in red
+    cv2.drawContours(image_bumps, [cnt2], -1, (0, 0, 255), 2)
+
+plt.imshow(image_bumps)
+plt.title("Cold Joints Marked")
+plt.show()
+
+
+---
+
+6. Output Bump Data
+
+Save bump sizes, positions, and defect classification in a CSV.
+
+import pandas as pd
+
+bump_data = []
+for cnt in bump_contours:
+    M = cv2.moments(cnt)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        area = cv2.contourArea(cnt)
+        diameter = np.sqrt(4 * area / np.pi)
+        defect = "Cold Joint" if any(cnt in pair for pair in cold_joint_pairs) else "Good"
+        
+        bump_data.append((cx, cy, diameter, defect))
+
+df = pd.DataFrame(bump_data, columns=["X", "Y", "Diameter", "Defect"])
+df.to_csv("bump_inspection_results.csv", index=False)
+
+print(df)
+
+
+---
+
+Next Steps & Enhancements
+
+1. Advanced Feature Extraction
+
+Use Hough Circle Transform (cv2.HoughCircles) to refine circular detection.
+
+Use Watershed Segmentation for better edge detection.
+
+
+
+2. Machine Learning-Based Classification
+
+Use SVM or CNN models to classify bumps as Good, Cold Joint, Missing, etc.
+
+Train a model using labeled X-ray images to improve accuracy.
+
+
+
+3. Real-Time Inspection
+
+Integrate the script with camera feeds to analyze images in real-time.
+
+Output results in GUI (Tkinter/PyQt) for interactive analysis
+
+
+
+
+
+Using Autoencoder for Anomaly Detection in Solder Bump Inspection
+
+You don’t necessarily need to train an autoencoder per bump, but rather a generalized model that learns the characteristics of good bumps and detects deviations.
+
+
+---
+
+1. Why Use an Autoencoder?
+
+Autoencoders can learn the normal shape, size, texture, and position of solder bumps.
+
+When an anomalous bump is inputted (misaligned, missing, cold joint, voids), the reconstruction error is higher.
+
+This method avoids manually defining defect conditions and instead lets the model learn by itself.
+
+
+
+---
+
+2. High-Level Approach
+
+1. Train the Autoencoder on Normal Bumps
+
+Extract patches of good solder bumps.
+
+Train a Convolutional Autoencoder to reconstruct them.
+
+
+
+2. Infer on New Images
+
+Pass each detected bump through the autoencoder.
+
+If reconstruction error is high, classify it as an anomaly.
+
+
+
+
+
+---
+
+3. Implementing the Autoencoder in Python
+
+Step 1: Extract Individual Bumps
+
+Use contour detection to crop out each bump.
+
+Normalize them to a fixed size (e.g., 32x32 pixels).
+
+
+import cv2
+import numpy as np
+
+def extract_bumps(image, contours, size=32):
+    bumps = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        bump = image[y:y+h, x:x+w]
+        bump = cv2.resize(bump, (size, size))  # Normalize to fixed size
+        bumps.append(bump)
+    return np.array(bumps) / 255.0  # Normalize pixel values
+
+# Extract bumps from detected contours
+bump_patches = extract_bumps(image, bump_contours)
+
+
+---
+
+Step 2: Define Autoencoder Model (Keras)
+
+A Convolutional Autoencoder (CAE) compresses and reconstructs images.
+
+It should only be trained on defect-free bumps.
+
+
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, UpSampling2D, Input
+from tensorflow.keras.models import Model
+
+# Define input shape
+input_shape = (32, 32, 1)
+input_img = Input(shape=input_shape)
+
+# Encoder
+x = Conv2D(32, (3, 3), activation='relu', padding='same')(input_img)
+x = MaxPooling2D((2, 2), padding='same')(x)
+x = Conv2D(16, (3, 3), activation='relu', padding='same')(x)
+x = MaxPooling2D((2, 2), padding='same')(x)
+
+# Bottleneck
+x = Conv2D(8, (3, 3), activation='relu', padding='same')(x)
+
+# Decoder
+x = UpSampling2D((2, 2))(x)
+x = Conv2D(16, (3, 3), activation='relu', padding='same')(x)
+x = UpSampling2D((2, 2))(x)
+x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+x = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(x)
+
+# Create autoencoder model
+autoencoder = Model(input_img, x)
+autoencoder.compile(optimizer='adam', loss='mse')
+autoencoder.summary()
+
+
+---
+
+Step 3: Train the Autoencoder
+
+Use only good bump images for training.
+
+
+# Train on normal solder bumps (reshaped for CNN input)
+bump_patches = bump_patches.reshape((-1, 32, 32, 1))
+
+autoencoder.fit(bump_patches, bump_patches, epochs=50, batch_size=32, validation_split=0.1)
+
+
+---
+
+Step 4: Detect Anomalies
+
+Pass new bumps through the model.
+
+Compare reconstruction error with a threshold to detect defects.
+
+
+# Test new bumps
+reconstructed = autoencoder.predict(bump_patches)
+
+# Compute reconstruction error (Mean Squared Error)
+errors = np.mean(np.abs(bump_patches - reconstructed), axis=(1,2,3))
+
+# Set threshold (adjust based on training results)
+threshold = np.percentile(errors, 95)
+
+# Detect anomalies
+anomalies = np.where(errors > threshold)[0]
+
+# Display detected anomalies
+for i in anomalies:
+    plt.imshow(bump_patches[i].reshape(32, 32), cmap="gray")
+    plt.title(f"Anomalous Bump - Error: {errors[i]:.4f}")
+    plt.show()
+
+
+---
+
+4. Extending to Detect Missing & Misaligned Bumps
+
+Missing bumps: If no contours are found where bumps are expected.
+
+Misaligned bumps: If centroid deviation from the expected grid exceeds a threshold.
+
+
+for cx, cy, d in bump_data:
+    nearest_grid_point = min(expected_positions, key=lambda p: np.linalg.norm(np.array(p) - np.array([cx, cy])))
+    deviation = np.linalg.norm(np.array(nearest_grid_point) - np.array([cx, cy]))
+
+    if deviation > alignment_threshold:
+        print(f"Misaligned bump detected at ({cx}, {cy})")
+
+
+---
+
+5. Alternative: Use Pretrained Anomaly Detection Models
+
+If training an autoencoder from scratch is too resource-intensive, consider:
+
+PatchCore (Few-Shot Anomaly Detection)
+
+FastFlow (Flow-based anomaly detection)
+
+YOLO-based detection for automated inspection
+
+
+
+---
