@@ -1,0 +1,623 @@
+
+
+---
+
+1. Key Improvements
+
+1. Autoencoder Anomaly Scoring
+
+After training, the autoencoder can predict (reconstruct) new bump patches.
+
+We calculate the mean absolute error (or MSE) between the input and reconstructed patch.
+
+The higher the error, the more likely the bump is anomalous.
+
+
+
+2. Optional Autoencoder-Based Defect Detection
+
+In the “Detect Bumps” phase, if the user enables “Use Autoencoder for anomaly detection,” each detected bump is passed through the autoencoder to compute an anomaly score.
+
+If the score exceeds a user-defined threshold, the bump is flagged as defective.
+
+
+
+3. Updating (Retraining/Fine-Tuning) the Model
+
+If new data is available (e.g., new good bumps or newly identified anomalies), you can load the existing autoencoder weights and call fit again to continue training (fine-tune) on the new data, or retrain from scratch as needed.
+
+Keras doesn’t allow partial fitting in the sense of incremental batch updates over time, but you can replicate a partial approach by re-calling fit with your new dataset (plus optionally some old data).
+
+
+
+
+
+---
+
+2. Example Python Code with Tkinter GUI (Improved Autoencoder + Anomaly Scoring)
+
+> This is an illustrative reference; in production, you’d modularize and handle exceptions more robustly.
+
+
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import cv2
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+# TensorFlow / Keras for Autoencoder
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D
+from tensorflow.keras import backend as K
+
+# -----------------------------------------
+# Global Defaults / Recipe Configuration
+# -----------------------------------------
+RECIPE = {
+    "blur_kernel": 5,
+    "use_clahe": True,
+    "clahe_clip": 2.0,
+    "clahe_grid": 8,
+    "threshold_dark": 50,
+    "threshold_light": 200,
+    "alignment_threshold": 10,
+    "circularity_low": 0.6,
+    "circularity_high": 1.2,
+    "area_min": 50,
+    "area_max": 2000,
+    "grid_x_start": 50,
+    "grid_x_end": 500,
+    "grid_x_step": 50,
+    "grid_y_start": 50,
+    "grid_y_end": 500,
+    "grid_y_step": 50,
+    
+    # Autoencoder
+    "autoencoder_epochs": 5,
+    "autoencoder_batch_size": 16,
+    "autoencoder_patch_size": 32,
+    
+    # Anomaly detection
+    "use_autoencoder_anomaly": False,
+    "anomaly_threshold": 0.05  # depends on training, can be adjusted
+}
+
+class BumpInspectorGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Solder Bump Inspection (Improved Autoencoder)")
+        
+        # Store images, results, models
+        self.original_image = None
+        self.processed_image = None
+        self.bumps_contours = []
+        
+        # Autoencoder model + state
+        self.autoencoder = None
+        self.ae_trained = False  # flag if AE is trained
+        self.last_anomaly_scores = []  # store anomaly scores after detection
+        
+        # UI
+        self.create_menu()
+        self.create_recipe_panel()
+        self.create_actions_panel()
+        self.create_image_panel()
+
+    # -----------------------------------------
+    # 1. Menu Bar
+    # -----------------------------------------
+    def create_menu(self):
+        menubar = tk.Menu(self.master)
+        
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="Open Image", command=self.open_image)
+        filemenu.add_separator()
+        filemenu.add_command(label="Exit", command=self.master.quit)
+        
+        menubar.add_cascade(label="File", menu=filemenu)
+        self.master.config(menu=menubar)
+
+    # -----------------------------------------
+    # 2. Recipe Panel
+    # -----------------------------------------
+    def create_recipe_panel(self):
+        recipe_frame = tk.LabelFrame(self.master, text="Recipe Settings", padx=5, pady=5)
+        recipe_frame.pack(side=tk.LEFT, fill=tk.Y)
+        
+        # Blur Kernel
+        tk.Label(recipe_frame, text="Blur Kernel").grid(row=0, column=0, sticky=tk.W)
+        self.blur_kernel_var = tk.IntVar(value=RECIPE["blur_kernel"])
+        tk.Entry(recipe_frame, textvariable=self.blur_kernel_var, width=5).grid(row=0, column=1)
+        
+        # Use CLAHE
+        self.use_clahe_var = tk.BooleanVar(value=RECIPE["use_clahe"])
+        tk.Checkbutton(recipe_frame, text="Use CLAHE", variable=self.use_clahe_var).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        
+        # Threshold Dark
+        tk.Label(recipe_frame, text="Thresh Dark").grid(row=2, column=0, sticky=tk.W)
+        self.thresh_dark_var = tk.IntVar(value=RECIPE["threshold_dark"])
+        tk.Entry(recipe_frame, textvariable=self.thresh_dark_var, width=5).grid(row=2, column=1)
+        
+        # Threshold Light
+        tk.Label(recipe_frame, text="Thresh Light").grid(row=3, column=0, sticky=tk.W)
+        self.thresh_light_var = tk.IntVar(value=RECIPE["threshold_light"])
+        tk.Entry(recipe_frame, textvariable=self.thresh_light_var, width=5).grid(row=3, column=1)
+        
+        # Alignment threshold
+        tk.Label(recipe_frame, text="Align. Thresh").grid(row=4, column=0, sticky=tk.W)
+        self.align_thresh_var = tk.IntVar(value=RECIPE["alignment_threshold"])
+        tk.Entry(recipe_frame, textvariable=self.align_thresh_var, width=5).grid(row=4, column=1)
+        
+        # Use Autoencoder Anomaly detection
+        self.use_ae_anomaly_var = tk.BooleanVar(value=RECIPE["use_autoencoder_anomaly"])
+        tk.Checkbutton(recipe_frame, text="Use AE Anomaly", variable=self.use_ae_anomaly_var).grid(row=5, column=0, columnspan=2, sticky=tk.W)
+        
+        tk.Label(recipe_frame, text="Anomaly Thresh").grid(row=6, column=0, sticky=tk.W)
+        self.anomaly_thresh_var = tk.DoubleVar(value=RECIPE["anomaly_threshold"])
+        tk.Entry(recipe_frame, textvariable=self.anomaly_thresh_var, width=5).grid(row=6, column=1)
+        
+    # -----------------------------------------
+    # 3. Actions Panel (Process, Detect, Train, Export)
+    # -----------------------------------------
+    def create_actions_panel(self):
+        actions_frame = tk.Frame(self.master, padx=5, pady=5)
+        actions_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        tk.Button(actions_frame, text="Process Image", command=self.process_image).pack(side=tk.LEFT, padx=5)
+        tk.Button(actions_frame, text="Detect Bumps", command=self.detect_bumps).pack(side=tk.LEFT, padx=5)
+        tk.Button(actions_frame, text="Train Autoencoder", command=self.train_autoencoder).pack(side=tk.LEFT, padx=5)
+        tk.Button(actions_frame, text="Export Bumps", command=self.export_bumps).pack(side=tk.LEFT, padx=5)
+        
+        # For updating model
+        tk.Button(actions_frame, text="Update Model", command=self.update_model).pack(side=tk.LEFT, padx=5)
+        
+    # -----------------------------------------
+    # 4. Image Display Panel
+    # -----------------------------------------
+    def create_image_panel(self):
+        self.image_panel = tk.Label(self.master)
+        self.image_panel.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
+        
+    # -----------------------------------------
+    # 5. Load Image
+    # -----------------------------------------
+    def open_image(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp")])
+        if not file_path:
+            return
+        
+        self.original_image = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+        if self.original_image is None:
+            messagebox.showerror("Error", "Could not open image.")
+            return
+        
+        # Reset results
+        self.bumps_contours = []
+        self.processed_image = None
+        self.last_anomaly_scores = []
+        
+        self.show_image(self.original_image)
+        
+    # -----------------------------------------
+    # 6. Apply Filters & Preprocessing
+    # -----------------------------------------
+    def process_image(self):
+        if self.original_image is None:
+            messagebox.showwarning("Warning", "No image loaded.")
+            return
+        
+        img = self.original_image.copy()
+        
+        # Gaussian Blur
+        blur_k = self.blur_kernel_var.get()
+        if blur_k > 0:
+            img = cv2.GaussianBlur(img, (blur_k, blur_k), 0)
+        
+        # CLAHE
+        if self.use_clahe_var.get():
+            clahe = cv2.createCLAHE(clipLimit=RECIPE["clahe_clip"], 
+                                    tileGridSize=(RECIPE["clahe_grid"], RECIPE["clahe_grid"]))
+            img = clahe.apply(img)
+        
+        self.processed_image = img
+        self.show_image(img)
+        messagebox.showinfo("Info", "Image processing completed.")
+        
+    # -----------------------------------------
+    # 7. Detect Bumps
+    # -----------------------------------------
+    def detect_bumps(self):
+        if self.processed_image is None:
+            messagebox.showwarning("Warning", "Please process the image first.")
+            return
+        
+        img = self.processed_image.copy()
+        
+        # Multi-threshold
+        _, dark_bin = cv2.threshold(img, self.thresh_dark_var.get(), 255, cv2.THRESH_BINARY)
+        _, light_bin = cv2.threshold(img, self.thresh_light_var.get(), 255, cv2.THRESH_BINARY_INV)
+        
+        combined = cv2.bitwise_or(dark_bin, light_bin)
+        
+        # Find contours
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter by area & circularity
+        filtered_contours = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * np.pi * (area / (perimeter**2))
+            if (RECIPE["area_min"] < area < RECIPE["area_max"] and
+                RECIPE["circularity_low"] < circularity < RECIPE["circularity_high"]):
+                filtered_contours.append(cnt)
+        
+        self.bumps_contours = filtered_contours
+        
+        # Optional: run anomaly detection if the user has trained an AE and enabled it
+        ae_anomaly_enabled = self.use_ae_anomaly_var.get()
+        self.last_anomaly_scores = []
+        
+        # Convert to color for visualization
+        display_img = cv2.cvtColor(self.processed_image, cv2.COLOR_GRAY2BGR)
+        
+        for cnt_idx, cnt in enumerate(filtered_contours):
+            color = (0, 255, 0)  # green by default
+            # Draw contour
+            cv2.drawContours(display_img, [cnt], -1, color, 2)
+        
+        if ae_anomaly_enabled and self.ae_trained and self.autoencoder:
+            # Compute anomaly scores for each bump
+            anomaly_threshold = self.anomaly_thresh_var.get()
+            patch_size = RECIPE["autoencoder_patch_size"]
+            
+            for cnt_idx, cnt in enumerate(filtered_contours):
+                x, y, w, h = cv2.boundingRect(cnt)
+                crop = self.processed_image[y:y+h, x:x+w]
+                crop_resized = cv2.resize(crop, (patch_size, patch_size))
+                crop_resized = crop_resized.astype(np.float32) / 255.0
+                crop_resized = np.expand_dims(crop_resized, axis=[0, -1])  # shape (1, h, w, 1)
+                
+                # Predict
+                recon = self.autoencoder.predict(crop_resized)
+                
+                # Calculate error (e.g., MAE)
+                error = np.mean(np.abs(crop_resized - recon))
+                self.last_anomaly_scores.append(error)
+                
+                # If above threshold => color red
+                if error > anomaly_threshold:
+                    cv2.drawContours(display_img, [cnt], -1, (0, 0, 255), 2)  # red
+        else:
+            self.last_anomaly_scores = [-1]*len(filtered_contours)
+        
+        self.show_image(display_img)
+        
+        # Missing & Misalignment
+        missing, misaligned = self.check_grid_defects(filtered_contours)
+        
+        msg = (f"Total Bumps Detected: {len(filtered_contours)}\n"
+               f"Missing Bumps: {len(missing)}\n"
+               f"Misaligned Bumps: {len(misaligned)}\n")
+        if ae_anomaly_enabled and self.ae_trained:
+            # Count anomalies
+            anomaly_count = sum(1 for e in self.last_anomaly_scores if e > self.anomaly_thresh_var.get())
+            msg += f"Anomalies Detected (AE): {anomaly_count}\n"
+        
+        messagebox.showinfo("Detection Results", msg)
+
+    def check_grid_defects(self, contours):
+        gx = np.arange(RECIPE["grid_x_start"], RECIPE["grid_x_end"], RECIPE["grid_x_step"])
+        gy = np.arange(RECIPE["grid_y_start"], RECIPE["grid_y_end"], RECIPE["grid_y_step"])
+        expected_positions = [(x, y) for x in gx for y in gy]
+        
+        detected_positions = []
+        for cnt in contours:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                detected_positions.append((cx, cy))
+        
+        missing_bumps = []
+        misaligned_bumps = []
+        align_thresh = self.align_thresh_var.get()
+        
+        for exp in expected_positions:
+            dists = [np.linalg.norm(np.array(exp) - np.array(d)) for d in detected_positions]
+            if not dists:
+                missing_bumps.append(exp)
+            else:
+                min_dist = min(dists)
+                if min_dist > align_thresh:
+                    # could be missing or misaligned
+                    if min_dist < align_thresh * 3:
+                        misaligned_bumps.append(exp)
+                    else:
+                        missing_bumps.append(exp)
+        
+        return missing_bumps, misaligned_bumps
+    
+    # -----------------------------------------
+    # 8. Train Autoencoder (on currently detected bumps)
+    # -----------------------------------------
+    def train_autoencoder(self):
+        if not self.bumps_contours:
+            messagebox.showwarning("Warning", "No bumps detected to train on.")
+            return
+        
+        if self.processed_image is None:
+            messagebox.showwarning("Warning", "Please process the image first.")
+            return
+        
+        patch_size = RECIPE["autoencoder_patch_size"]
+        patches = []
+        
+        # Extract each bump patch
+        for cnt in self.bumps_contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            crop = self.processed_image[y:y+h, x:x+w]
+            crop = cv2.resize(crop, (patch_size, patch_size))
+            patches.append(crop)
+        
+        # Convert to float, scale 0-1
+        patches = np.array(patches, dtype=np.float32) / 255.0
+        patches = np.expand_dims(patches, axis=-1)  # shape (N, 32, 32, 1)
+        
+        # Build or re-build the autoencoder
+        self.autoencoder = self.build_autoencoder(input_shape=(patch_size, patch_size, 1))
+        
+        # Train
+        epochs = RECIPE["autoencoder_epochs"]
+        batch_size = RECIPE["autoencoder_batch_size"]
+        
+        self.autoencoder.fit(patches, patches, epochs=epochs, batch_size=batch_size, validation_split=0.1)
+        
+        self.ae_trained = True
+        messagebox.showinfo("Info", "Autoencoder training completed.")
+    
+    def build_autoencoder(self, input_shape):
+        # Example architecture
+        inp = Input(shape=input_shape)
+        
+        # Encoder
+        x = Conv2D(16, (3,3), activation='relu', padding='same')(inp)
+        x = MaxPooling2D((2,2), padding='same')(x)
+        x = Conv2D(8, (3,3), activation='relu', padding='same')(x)
+        x = MaxPooling2D((2,2), padding='same')(x)
+        
+        # Bottleneck
+        # You could add more layers here if needed.
+        
+        # Decoder
+        x = Conv2D(8, (3,3), activation='relu', padding='same')(x)
+        x = UpSampling2D((2,2))(x)
+        x = Conv2D(16, (3,3), activation='relu', padding='same')(x)
+        x = UpSampling2D((2,2))(x)
+        
+        outp = Conv2D(1, (3,3), activation='sigmoid', padding='same')(x)
+        
+        autoenc = Model(inp, outp)
+        autoenc.compile(optimizer='adam', loss='mse')
+        autoenc.summary()
+        return autoenc
+    
+    # -----------------------------------------
+    # 9. Export Bumps
+    # -----------------------------------------
+    def export_bumps(self):
+        if not self.bumps_contours:
+            messagebox.showwarning("Warning", "No bumps detected to export.")
+            return
+        
+        if self.processed_image is None:
+            messagebox.showwarning("Warning", "Please process the image first.")
+            return
+        
+        export_dir = filedialog.askdirectory()
+        if not export_dir:
+            return
+        
+        patch_size = RECIPE["autoencoder_patch_size"]
+        for i, cnt in enumerate(self.bumps_contours):
+            x, y, w, h = cv2.boundingRect(cnt)
+            crop = self.processed_image[y:y+h, x:x+w]
+            crop = cv2.resize(crop, (patch_size, patch_size))
+            filename = os.path.join(export_dir, f"bump_{i}.png")
+            cv2.imwrite(filename, crop)
+        
+        messagebox.showinfo("Export", f"Exported {len(self.bumps_contours)} bumps to {export_dir}")
+    
+    # -----------------------------------------
+    # 10. Update (Fine-Tune) Model with New Data
+    # -----------------------------------------
+    def update_model(self):
+        """
+        Demonstrates how you'd re-train or fine-tune the existing autoencoder 
+        with new data (user-labeled good bumps, for example).
+        """
+        if not self.autoencoder or not self.ae_trained:
+            messagebox.showwarning("Warning", "No trained model found. Train first.")
+            return
+        
+        # Suppose user picks a folder of known good bumps or newly captured bumps
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+        
+        # Load images for additional training
+        patch_size = RECIPE["autoencoder_patch_size"]
+        new_bumps = []
+        for file in os.listdir(folder):
+            if file.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                path = os.path.join(folder, file)
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    img = cv2.resize(img, (patch_size, patch_size))
+                    img = img.astype(np.float32) / 255.0
+                    new_bumps.append(img)
+        
+        if not new_bumps:
+            messagebox.showwarning("Warning", "No valid images found in the folder.")
+            return
+        
+        new_bumps = np.array(new_bumps)
+        new_bumps = np.expand_dims(new_bumps, axis=-1)  # shape (N, 32, 32, 1)
+        
+        # Fine-tune or continue training
+        self.autoencoder.fit(new_bumps, new_bumps,
+                             epochs=RECIPE["autoencoder_epochs"],
+                             batch_size=RECIPE["autoencoder_batch_size"],
+                             validation_split=0.1)
+        
+        messagebox.showinfo("Update Model", "Model has been fine-tuned with new data.")
+        
+    # -----------------------------------------
+    # Utility: Show Image in TK Label
+    # -----------------------------------------
+    def show_image(self, img):
+        if len(img.shape) == 2:
+            disp_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            disp_img = img.copy()
+        
+        disp_img = cv2.resize(disp_img, (400, 400))  # for display
+        disp_img = cv2.cvtColor(disp_img, cv2.COLOR_BGR2RGB)
+        
+        from PIL import Image, ImageTk
+        im = Image.fromarray(disp_img)
+        imgtk = ImageTk.PhotoImage(image=im)
+        self.image_panel.configure(image=imgtk)
+        self.image_panel.image = imgtk  # keep reference
+
+def main():
+    root = tk.Tk()
+    app = BumpInspectorGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+3. Using the Autoencoder Anomaly Scores (How It Works)
+
+1. Train the Autoencoder
+
+Click “Train Autoencoder” after detecting bumps you believe to be good (or mostly good).
+
+The autoencoder will learn to reconstruct these normal bumps.
+
+
+
+2. Set “Use AE Anomaly” to True
+
+In the Recipe Settings, check “Use AE Anomaly” and set an anomaly threshold (e.g., 0.05).
+
+The threshold is empirical—you adjust it based on your data distribution (view reconstruction errors of good vs. defective bumps).
+
+
+
+3. Detect Bumps
+
+The code automatically predicts each bump patch, calculates the reconstruction error, and if the error > threshold, it’s flagged in red as an anomaly.
+
+
+
+4. Update / Fine-Tune
+
+If you gather new, reliable data (good or mislabeled bumps), you can load them using “Update Model”.
+
+The code will continue training (fit again) on this new data, effectively fine-tuning the autoencoder.
+
+
+
+
+
+---
+
+4. How to Update the Model
+
+Retraining vs. Fine-Tuning
+
+1. Fine-Tuning
+
+Load the existing autoencoder (with already trained weights).
+
+Call model.fit(new_data, new_data) to continue training.
+
+Good if new data is similar in distribution but adds a bit more variety.
+
+
+
+2. Full Retraining
+
+If a large amount of new data or new defect classes appear, you might want to:
+
+1. Combine old + new data into a single dataset.
+
+
+2. Re-initialize or load the old model.
+
+
+3. Train from scratch or from old weights.
+
+
+
+
+
+3. Practical Considerations
+
+Keep an archive of “good” bumps.
+
+Periodically re-validate your threshold.
+
+Save your model weights (model.save("autoencoder.h5")) so you can revert if needed.
+
+
+
+
+
+---
+
+5. Recommendations & Further Steps
+
+1. Better Architecture
+
+For subtle defects, consider deeper or specialized networks (e.g., U-Net-style autoencoders).
+
+Use SSIM loss or perceptual losses for improved reconstructions.
+
+
+
+2. Outlier Score Calibration
+
+Plot distribution of reconstruction errors for a known set of good bumps and some known defective bumps.
+
+Pick a threshold that yields a low false positive rate but still catches real defects.
+
+
+
+3. Integration with YOLO or Other Detectors
+
+If you prefer bounding-box detection for multiple defect classes, YOLO can be trained to detect missing, bridging, or large voids directly.
+
+
+
+4. Real-Time Monitoring
+
+Move from Tkinter to an industrial GUI or a web-based front-end for remote monitoring.
+
+Integrate with a database to store inspection results over time for big data analysis.
+
+
+
+5. 3D CT / Laminography
+
+If 2D images are insufficient, consider 3D X-ray to see hidden defects or 
